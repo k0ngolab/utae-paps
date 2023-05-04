@@ -109,6 +109,17 @@ parser.add_argument(
 list_args = ["encoder_widths", "decoder_widths", "out_conv"]
 parser.set_defaults(cache=False)
 
+def stitch_patches(patches, num_rows, num_cols, patch_size):
+    stitched_image = np.zeros((num_rows * patch_size, num_cols * patch_size), dtype=patches.dtype)
+
+    patch_idx = 0
+    for row in range(num_rows):
+        for col in range(num_cols):
+            stitched_image[row * patch_size:(row + 1) * patch_size, col * patch_size:(col + 1) * patch_size] = patches[patch_idx]
+            patch_idx += 1
+
+    return stitched_image
+
 
 def iterate(
     model, data_loader, criterion, config, optimizer=None, mode="train", device=None
@@ -119,43 +130,59 @@ def iterate(
         ignore_index=config.ignore_index,
         cm_device=config.device,
     )
+    patch_size = 32
 
     t_start = time.time()
+    preds_list = []  # Store predictions for each patch
+    ys_list = []  # Store ground truth labels for each patch
     for i, batch in enumerate(data_loader):
         if device is not None:
             batch = recursive_todevice(batch, device)
         (x, dates), y = batch
         y = y.long()
 
-        if mode != "train":
+        x_patches = x.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+        x_patches = x_patches.reshape(x.shape[0], x.shape[1], -1, patch_size, patch_size).permute(2, 0, 1, 3, 4)
+
+        batch_preds = []  # Store predictions for this batch
+        batch_ys = []  # Store ground truth labels for this batch
+
+        for patch_idx in range(x_patches.shape[0]):
+            x_patch = x_patches[patch_idx].unsqueeze(0)
+
+            if mode != "train":
+                with torch.no_grad():
+                    out = model(x_patch, batch_positions=dates)
+            else:
+                optimizer.zero_grad()
+                out = model(x_patch, batch_positions=dates)
+
+            loss = criterion(out, y)
+            if mode == "train":
+                loss.backward()
+                optimizer.step()
+
             with torch.no_grad():
-                out = model(x, batch_positions=dates)
-        else:
-            optimizer.zero_grad()
-            out = model(x, batch_positions=dates)
+                pred_patch = out.argmax(dim=1)
 
-        loss = criterion(out, y)
-        if mode == "train":
-            loss.backward()
-            optimizer.step()
+            batch_preds.append(pred_patch.cpu().numpy())
+            batch_ys.append(y.cpu().numpy())
 
-        with torch.no_grad():
-            pred = out.argmax(dim=1)
-        iou_meter.add(pred, y)
-        loss_meter.add(loss.item())
+        preds_list.extend(batch_preds)
+        ys_list.extend(batch_ys)
 
-        if (i + 1) % config.display_step == 0:
-            miou, acc = iou_meter.get_miou_acc()
-            print(
-                "Step [{}/{}], Loss: {:.4f}, Acc : {:.2f}, mIoU {:.2f}".format(
-                    i + 1, len(data_loader), loss_meter.value()[0], acc, miou
-                )
-            )
+    num_rows = 128 // patch_size
+    num_cols = 128 // patch_size
+    pred_full = stitch_patches(np.array(preds_list), num_rows, num_cols, patch_size)
+    y_full = stitch_patches(np.array(ys_list), num_rows, num_cols, patch_size)
+
+    iou_meter.add(pred_full, y_full)
+    miou, acc = iou_meter.get_miou_acc()
 
     t_end = time.time()
     total_time = t_end - t_start
     print("Epoch time : {:.1f}s".format(total_time))
-    miou, acc = iou_meter.get_miou_acc()
+
     metrics = {
         "{}_accuracy".format(mode): acc,
         "{}_loss".format(mode): loss_meter.value()[0],
